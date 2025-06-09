@@ -97,6 +97,43 @@ async def generate_presigned_url(
         logger.error(f"Error inesperado: {e}")
         raise HTTPException(status_code=500, detail="Error interno inesperado.")
 
+@app.get("/generate-download-url")
+async def generate_presigned_download_url(
+    file_name: str = Query(..., description="El nombre del archivo en S3 a descargar (incluyendo extensión)")
+):
+    """
+    Genera una URL firmada de S3 para permitir la descarga (GET) de un archivo.
+    Utiliza S3_DOWNLOAD_BUCKET_NAME si está definida, sino S3_BUCKET_NAME.
+    """
+    s3_download_bucket = os.getenv("S3_DOWNLOAD_BUCKET_NAME")
+    target_bucket = s3_download_bucket if s3_download_bucket else S3_BUCKET
+
+    if not target_bucket:
+        logger.error("Ni S3_DOWNLOAD_BUCKET_NAME ni S3_BUCKET_NAME están configurados en las variables de entorno.")
+        raise HTTPException(status_code=500, detail="Error interno del servidor: Bucket S3 para descarga no configurado.")
+
+    object_name = file_name
+
+    try:
+        response = s3_client.generate_presigned_url(
+            'get_object',
+            Params={
+                'Bucket': target_bucket,
+                'Key': object_name
+            },
+            ExpiresIn=PRESIGNED_URL_EXPIRATION,
+            HttpMethod='GET' # Especifica que la URL es para una operación GET
+        )
+        logger.info(f"URL firmada de descarga generada para {object_name} en bucket {target_bucket}")
+        return {"presigned_url": response, "object_key": object_name, "bucket": target_bucket}
+
+    except ClientError as e:
+        logger.error(f"Error generando URL firmada de descarga para {object_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"No se pudo generar la URL firmada de descarga: {e}")
+    except Exception as e:
+        logger.error(f"Error inesperado al generar URL de descarga: {e}")
+        raise HTTPException(status_code=500, detail="Error interno inesperado al generar URL de descarga.")
+
 # Endpoint de salud simple
 @app.get("/health")
 async def health_check():
