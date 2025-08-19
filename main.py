@@ -41,6 +41,7 @@ app.add_middleware(
 
 # Configuración del cliente S3
 S3_BUCKET = os.getenv("S3_BUCKET_NAME")
+S3_BUCKET_SECONDARY = os.getenv("S3_BUCKET_SECONDARY_NAME")  # Segundo bucket
 AWS_REGION = os.getenv("AWS_REGION")
 PRESIGNED_URL_EXPIRATION = int(os.getenv("PRESIGNED_URL_EXPIRATION", 3600))
 
@@ -138,5 +139,71 @@ async def generate_presigned_download_url(
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+@app.get("/generate-presigned-url-secondary")
+async def generate_presigned_url_secondary(
+    file_name: str = Query(..., description="El nombre deseado para el archivo en el segundo bucket S3 (incluyendo extensión)")
+):
+    """
+    Genera una URL firmada de S3 para permitir la subida (PUT) de un archivo al bucket secundario.
+    """
+    if not S3_BUCKET_SECONDARY:
+        logger.error("S3_BUCKET_SECONDARY_NAME no está configurado en las variables de entorno.")
+        raise HTTPException(status_code=500, detail="Error interno del servidor: Bucket secundario S3 no configurado.")
+
+    object_name = file_name
+
+    try:
+        response = s3_client.generate_presigned_url(
+            'put_object',
+            Params={
+                'Bucket': S3_BUCKET_SECONDARY,
+                'Key': object_name
+            },
+            ExpiresIn=PRESIGNED_URL_EXPIRATION,
+            HttpMethod='PUT'
+        )
+        logger.info(f"URL firmada generada para {object_name} en bucket secundario {S3_BUCKET_SECONDARY}")
+        return {"presigned_url": response, "object_key": object_name, "bucket": S3_BUCKET_SECONDARY}
+
+    except ClientError as e:
+        logger.error(f"Error generando URL firmada para {object_name} en bucket secundario: {e}")
+        raise HTTPException(status_code=500, detail=f"No se pudo generar la URL firmada: {e}")
+    except Exception as e:
+        logger.error(f"Error inesperado: {e}")
+        raise HTTPException(status_code=500, detail="Error interno inesperado.")
+
+@app.get("/generate-download-url-secondary")
+async def generate_presigned_download_url_secondary(
+    file_name: str = Query(..., description="El nombre del archivo en el bucket secundario S3 a descargar (incluyendo extensión)")
+):
+    """
+    Genera una URL firmada de S3 para permitir la descarga (GET) de un archivo del bucket secundario.
+    """
+    if not S3_BUCKET_SECONDARY:
+        logger.error("S3_BUCKET_SECONDARY_NAME no está configurado en las variables de entorno.")
+        raise HTTPException(status_code=500, detail="Error interno del servidor: Bucket secundario S3 no configurado.")
+
+    object_name = file_name
+
+    try:
+        response = s3_client.generate_presigned_url(
+            'get_object',
+            Params={
+                'Bucket': S3_BUCKET_SECONDARY,
+                'Key': object_name
+            },
+            ExpiresIn=PRESIGNED_URL_EXPIRATION,
+            HttpMethod='GET'
+        )
+        logger.info(f"URL firmada de descarga generada para {object_name} en bucket secundario {S3_BUCKET_SECONDARY}")
+        return {"presigned_url": response, "object_key": object_name, "bucket": S3_BUCKET_SECONDARY}
+
+    except ClientError as e:
+        logger.error(f"Error generando URL firmada de descarga para {object_name} en bucket secundario: {e}")
+        raise HTTPException(status_code=500, detail=f"No se pudo generar la URL firmada de descarga: {e}")
+    except Exception as e:
+        logger.error(f"Error inesperado al generar URL de descarga: {e}")
+        raise HTTPException(status_code=500, detail="Error interno inesperado al generar URL de descarga.")
 
 # Para ejecutar localmente: uvicorn main:app --reload --host 0.0.0.0 --port 8000
