@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException, Query
 from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware # Necesario para permitir peticiones desde Flutter
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
@@ -40,23 +41,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuración del cliente S3
-S3_BUCKET = os.getenv("S3_BUCKET_NAME")
-S3_BUCKET_SECONDARY = os.getenv("S3_BUCKET_SECONDARY_NAME")  # Segundo bucket
-S3_SICOM_BUCKET = os.getenv("S3_SICOM_BUCKET_NAME")  # Bucket sicomimages
-AWS_REGION = os.getenv("AWS_REGION")
+# --- Proveedor de almacenamiento ---------------------------------------------
+# STORAGE_PROVIDER decide contra quién se firman las URLs de Linkmi. Permite
+# hacer el corte (y revertirlo) cambiando una variable de entorno, sin desplegar
+# código. Por defecto "s3": desplegar este código no cambia nada por sí solo.
+#
+# SICOM queda deliberadamente fuera de este interruptor: ver sicom_client abajo.
+STORAGE_PROVIDER = os.getenv("STORAGE_PROVIDER", "s3").strip().lower()
+
+if STORAGE_PROVIDER not in ("s3", "r2"):
+    raise RuntimeError(
+        f"STORAGE_PROVIDER='{STORAGE_PROVIDER}' no es válido. Usa 's3' o 'r2'."
+    )
+
 PRESIGNED_URL_EXPIRATION = int(os.getenv("PRESIGNED_URL_EXPIRATION", 3600))
 
-# Es mejor usar variables de entorno para las credenciales
-# Boto3 las buscará automáticamente si están configuradas en el entorno
-# (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN opcional)
-# o en ~/.aws/credentials
-s3_client = boto3.client(
-    's3',
-    region_name=AWS_REGION,
-    config=boto3.session.Config(signature_version='s3v4') # Recomendado
-    # No pases access_key_id y secret_access_key aquí directamente
-    # si usas variables de entorno o roles IAM (mejor práctica)
+
+def _bucket(suffix):
+    """Devuelve el bucket de Linkmi para el proveedor activo.
+
+    Con STORAGE_PROVIDER=r2 se lee R2_<suffix> y, si no está definida, se cae a
+    S3_<suffix>: así no hay que duplicar variables si el bucket se llama igual
+    en ambos lados.
+    """
+    if STORAGE_PROVIDER == "r2":
+        value = os.getenv(f"R2_{suffix}")
+        if value:
+            return value
+    return os.getenv(f"S3_{suffix}")
+
+
+S3_BUCKET = _bucket("BUCKET_NAME")
+S3_BUCKET_SECONDARY = _bucket("BUCKET_SECONDARY_NAME")  # Segundo bucket
+DOWNLOAD_BUCKET = _bucket("DOWNLOAD_BUCKET_NAME") or S3_BUCKET
+
+# SICOM no pasa por _bucket(): su bucket es siempre el de Amazon.
+S3_SICOM_BUCKET = os.getenv("S3_SICOM_BUCKET_NAME")  # Bucket sicomimages
+
+
+def _build_client(provider):
+    """Cliente boto3 para el proveedor indicado.
+
+    R2 habla el protocolo S3, así que solo cambian endpoint, región y de dónde
+    salen las credenciales.
+    """
+    config = Config(signature_version="s3v4")
+
+    if provider == "r2":
+        account_id = os.getenv("R2_ACCOUNT_ID")
+        access_key = os.getenv("R2_ACCESS_KEY_ID")
+        secret_key = os.getenv("R2_SECRET_ACCESS_KEY")
+
+        if not all([account_id, access_key, secret_key]):
+            logger.warning(
+                "Faltan R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY: "
+                "las URLs firmadas se generarán pero R2 las rechazará con 403."
+            )
+
+        # En R2 no hay roles IAM ni ~/.aws de donde boto3 pueda tomar las
+        # credenciales solo: hay que pasarlas explícitamente.
+        return boto3.client(
+            "s3",
+            endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name="auto",  # R2 lo exige. Sin esto, boto3 falla con "Invalid credentials".
+            config=config,
+        )
+
+    # S3: boto3 busca las credenciales en el entorno, en ~/.aws o en el rol IAM.
+    return boto3.client("s3", region_name=os.getenv("AWS_REGION"), config=config)
+
+
+s3_client = _build_client(STORAGE_PROVIDER)
+
+# El bucket de SICOM (sicomimages) no forma parte de la migración a R2 y nunca
+# se copió allí. Si reutilizara s3_client, girar STORAGE_PROVIDER mandaría a
+# SICOM a un bucket que en R2 no existe y lo dejaría caído por un cambio que no
+# iba con él. Por eso tiene cliente propio, clavado a Amazon.
+sicom_client = s3_client if STORAGE_PROVIDER == "s3" else _build_client("s3")
+
+logger.info(
+    "Proveedor de Linkmi: %s | buckets: principal=%s secundario=%s descarga=%s | SICOM: S3 (%s)",
+    STORAGE_PROVIDER.upper(), S3_BUCKET, S3_BUCKET_SECONDARY, DOWNLOAD_BUCKET, S3_SICOM_BUCKET,
 )
 
 @app.get("/generate-presigned-url")
@@ -108,8 +175,7 @@ async def generate_presigned_download_url(
     Genera una URL firmada de S3 para permitir la descarga (GET) de un archivo.
     Utiliza S3_DOWNLOAD_BUCKET_NAME si está definida, sino S3_BUCKET_NAME.
     """
-    s3_download_bucket = os.getenv("S3_DOWNLOAD_BUCKET_NAME")
-    target_bucket = s3_download_bucket if s3_download_bucket else S3_BUCKET
+    target_bucket = DOWNLOAD_BUCKET
 
     if not target_bucket:
         logger.error("Ni S3_DOWNLOAD_BUCKET_NAME ni S3_BUCKET_NAME están configurados en las variables de entorno.")
@@ -140,7 +206,7 @@ async def generate_presigned_download_url(
 # Endpoint de salud simple
 @app.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "storage_provider": STORAGE_PROVIDER, "sicom_provider": "s3"}
 
 @app.get("/generate-presigned-url-secondary")
 async def generate_presigned_url_secondary(
@@ -225,7 +291,7 @@ async def generate_sicom_upload_url(
     object_name = f"{project}/{file_name}"
     
     try:
-        response = s3_client.generate_presigned_url(
+        response = sicom_client.generate_presigned_url(
             'put_object',
             Params={
                 'Bucket': S3_SICOM_BUCKET,
@@ -274,7 +340,7 @@ async def generate_sicom_download_url(
         )
     
     try:
-        response = s3_client.generate_presigned_url(
+        response = sicom_client.generate_presigned_url(
             'get_object',
             Params={
                 'Bucket': S3_SICOM_BUCKET,
