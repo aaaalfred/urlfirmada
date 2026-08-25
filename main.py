@@ -8,6 +8,8 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
+from storage_keys import extraer_key, limpiar_env
+
 # Cargar variables de entorno desde .env
 load_dotenv()
 
@@ -47,14 +49,14 @@ app.add_middleware(
 # código. Por defecto "s3": desplegar este código no cambia nada por sí solo.
 #
 # SICOM queda deliberadamente fuera de este interruptor: ver sicom_client abajo.
-STORAGE_PROVIDER = os.getenv("STORAGE_PROVIDER", "s3").strip().lower()
+STORAGE_PROVIDER = (limpiar_env("STORAGE_PROVIDER", default="s3") or "s3").lower()
 
 if STORAGE_PROVIDER not in ("s3", "r2"):
     raise RuntimeError(
         f"STORAGE_PROVIDER='{STORAGE_PROVIDER}' no es válido. Usa 's3' o 'r2'."
     )
 
-PRESIGNED_URL_EXPIRATION = int(os.getenv("PRESIGNED_URL_EXPIRATION", 3600))
+PRESIGNED_URL_EXPIRATION = int(limpiar_env("PRESIGNED_URL_EXPIRATION", default="3600"))
 
 
 def _bucket(suffix):
@@ -65,10 +67,10 @@ def _bucket(suffix):
     en ambos lados.
     """
     if STORAGE_PROVIDER == "r2":
-        value = os.getenv(f"R2_{suffix}")
+        value = limpiar_env(f"R2_{suffix}")
         if value:
             return value
-    return os.getenv(f"S3_{suffix}")
+    return limpiar_env(f"S3_{suffix}")
 
 
 S3_BUCKET = _bucket("BUCKET_NAME")
@@ -76,7 +78,7 @@ S3_BUCKET_SECONDARY = _bucket("BUCKET_SECONDARY_NAME")  # Segundo bucket
 DOWNLOAD_BUCKET = _bucket("DOWNLOAD_BUCKET_NAME") or S3_BUCKET
 
 # SICOM no pasa por _bucket(): su bucket es siempre el de Amazon.
-S3_SICOM_BUCKET = os.getenv("S3_SICOM_BUCKET_NAME")  # Bucket sicomimages
+S3_SICOM_BUCKET = limpiar_env("S3_SICOM_BUCKET_NAME")  # Bucket sicomimages
 
 
 def _build_client(provider):
@@ -88,9 +90,9 @@ def _build_client(provider):
     config = Config(signature_version="s3v4")
 
     if provider == "r2":
-        account_id = os.getenv("R2_ACCOUNT_ID")
-        access_key = os.getenv("R2_ACCESS_KEY_ID")
-        secret_key = os.getenv("R2_SECRET_ACCESS_KEY")
+        account_id = limpiar_env("R2_ACCOUNT_ID")
+        access_key = limpiar_env("R2_ACCESS_KEY_ID")
+        secret_key = limpiar_env("R2_SECRET_ACCESS_KEY")
 
         if not all([account_id, access_key, secret_key]):
             logger.warning(
@@ -100,9 +102,13 @@ def _build_client(provider):
 
         # En R2 no hay roles IAM ni ~/.aws de donde boto3 pueda tomar las
         # credenciales solo: hay que pasarlas explícitamente.
+        # R2_ENDPOINT permite apuntar a un endpoint distinto (p. ej. jurisdicción
+        # europea) sin tocar código; si no está, se arma desde la cuenta.
+        endpoint = limpiar_env("R2_ENDPOINT") or f"https://{account_id}.r2.cloudflarestorage.com"
+
         return boto3.client(
             "s3",
-            endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
+            endpoint_url=endpoint,
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
             region_name="auto",  # R2 lo exige. Sin esto, boto3 falla con "Invalid credentials".
@@ -110,7 +116,7 @@ def _build_client(provider):
         )
 
     # S3: boto3 busca las credenciales en el entorno, en ~/.aws o en el rol IAM.
-    return boto3.client("s3", region_name=os.getenv("AWS_REGION"), config=config)
+    return boto3.client("s3", region_name=limpiar_env("AWS_REGION"), config=config)
 
 
 s3_client = _build_client(STORAGE_PROVIDER)
@@ -174,6 +180,11 @@ async def generate_presigned_download_url(
     """
     Genera una URL firmada de S3 para permitir la descarga (GET) de un archivo.
     Utiliza S3_DOWNLOAD_BUCKET_NAME si está definida, sino S3_BUCKET_NAME.
+
+    `file_name` admite tanto una key desnuda como una URL completa guardada en
+    la base (S3 virtual-host o path-style, R2, dominio propio, s3://). Se
+    normaliza antes de firmar: sin esto, una URL absoluta se firmaría como key
+    literal y el almacén respondería NoSuchKey.
     """
     target_bucket = DOWNLOAD_BUCKET
 
@@ -181,7 +192,15 @@ async def generate_presigned_download_url(
         logger.error("Ni S3_DOWNLOAD_BUCKET_NAME ni S3_BUCKET_NAME están configurados en las variables de entorno.")
         raise HTTPException(status_code=500, detail="Error interno del servidor: Bucket S3 para descarga no configurado.")
 
-    object_name = file_name
+    object_name = extraer_key(file_name)
+    if not object_name:
+        logger.warning("No se pudo obtener una key de: %r", file_name)
+        raise HTTPException(
+            status_code=400,
+            detail="El parámetro file_name no contiene una referencia de archivo válida.",
+        )
+    if object_name != file_name:
+        logger.info("Referencia normalizada: %r -> %r", file_name, object_name)
 
     try:
         response = s3_client.generate_presigned_url(
@@ -203,10 +222,23 @@ async def generate_presigned_download_url(
         logger.error(f"Error inesperado al generar URL de descarga: {e}")
         raise HTTPException(status_code=500, detail="Error interno inesperado al generar URL de descarga.")
 
-# Endpoint de salud simple
+# Endpoint de salud. Expone la configuración efectiva de buckets para poder
+# verificar de un vistazo, durante el cutover, que este servicio y LinkNext
+# apuntan al mismo sitio. No expone credenciales.
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "storage_provider": STORAGE_PROVIDER, "sicom_provider": "s3"}
+    return {
+        "status": "ok",
+        "storage_provider": STORAGE_PROVIDER,
+        "sicom_provider": "s3",
+        "buckets": {
+            "principal": S3_BUCKET,
+            "secundario": S3_BUCKET_SECONDARY,
+            "descarga": DOWNLOAD_BUCKET,
+            "sicom": S3_SICOM_BUCKET,
+        },
+        "normaliza_url_a_key": True,
+    }
 
 @app.get("/generate-presigned-url-secondary")
 async def generate_presigned_url_secondary(
@@ -247,12 +279,20 @@ async def generate_presigned_download_url_secondary(
 ):
     """
     Genera una URL firmada de S3 para permitir la descarga (GET) de un archivo del bucket secundario.
+
+    Igual que en el bucket principal, `file_name` admite key o URL completa.
     """
     if not S3_BUCKET_SECONDARY:
         logger.error("S3_BUCKET_SECONDARY_NAME no está configurado en las variables de entorno.")
         raise HTTPException(status_code=500, detail="Error interno del servidor: Bucket secundario S3 no configurado.")
 
-    object_name = file_name
+    object_name = extraer_key(file_name)
+    if not object_name:
+        logger.warning("No se pudo obtener una key de: %r", file_name)
+        raise HTTPException(
+            status_code=400,
+            detail="El parámetro file_name no contiene una referencia de archivo válida.",
+        )
 
     try:
         response = s3_client.generate_presigned_url(
@@ -328,8 +368,13 @@ async def generate_sicom_download_url(
     
     # Determinar la clave del objeto S3
     if s3_path:
-        # Usar la ruta S3 completa proporcionada
-        object_name = s3_path
+        # `s3_path` puede llegar como URL completa: normalizar antes de firmar.
+        object_name = extraer_key(s3_path)
+        if not object_name:
+            raise HTTPException(
+                status_code=400,
+                detail="El parámetro s3_path no contiene una referencia de archivo válida.",
+            )
     elif project and file_name:
         # Construir la ruta usando proyecto y nombre de archivo
         object_name = f"{project}/{file_name}"

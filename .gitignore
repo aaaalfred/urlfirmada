@@ -10,3 +10,7 @@ __pycache__/
 
 # Archivos de Jupyter con datos sensibles o pesados (opcional)
 *.ipynb
+
+# Logs de ejecución del servicio (ruido local, no versionar)
+log.txt
+nohup.out
