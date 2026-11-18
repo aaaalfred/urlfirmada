@@ -22,9 +22,19 @@ Es el equivalente Python de `extractKeyFromUrl` de LinkNext
 (`src/lib/storage/keys.ts`), y debe mantenerse alineado con él.
 """
 
+import re
 from urllib.parse import urlparse, unquote
 
 __all__ = ["extraer_key", "limpiar_env"]
+
+# R2 tiene dos formatos de URL (mismos patrones que `keys.ts` de LinkNext):
+#   virtual-host: <bucket>.<cuenta de 32 hex>[.eu|.fedramp].r2.cloudflarestorage.com/<key>
+#                 (el que genera el SDK; CGW lo guarda así)
+#   path-style:   <cuenta>[.eu|.fedramp].r2.cloudflarestorage.com/<bucket>/<key>
+_R2_VIRTUAL_HOST = re.compile(
+    r"^(.+)\.([0-9a-f]{32})\.(?:(?:eu|fedramp)\.)?r2\.cloudflarestorage\.com$", re.I
+)
+_R2_PATH_HOST = re.compile(r"^[^.]+\.(?:(?:eu|fedramp)\.)?r2\.cloudflarestorage\.com$", re.I)
 
 
 def _sin_query(valor: str) -> str:
@@ -74,8 +84,13 @@ def extraer_key(valor):
                 return None
             return unquote(_sin_query(partes[1])) or None
 
-        # R2: <cuenta>.r2.cloudflarestorage.com/<bucket>/<key>
-        if host.endswith(".r2.cloudflarestorage.com"):
+        # R2 virtual-host: el bucket va en el host y la ruta completa es la key.
+        # Va antes del path-style, que le quitaría la primera carpeta a la key.
+        if _R2_VIRTUAL_HOST.match(host):
+            return unquote(_sin_query(ruta)) or None
+
+        # R2 path-style: <cuenta>.r2.cloudflarestorage.com/<bucket>/<key>
+        if _R2_PATH_HOST.match(host):
             partes = ruta.split("/", 1)
             if len(partes) != 2 or not partes[1]:
                 return None

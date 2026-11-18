@@ -56,6 +56,46 @@ def test_url_r2():
     ) == "linkmi/x.pdf"
 
 
+CUENTA = "454aa4f64af9162765a2adeb51750baf"
+
+
+def test_url_r2_virtual_host_conserva_carpetas():
+    """Formato del SDK (lo guarda CGW): bucket en el host, la ruta entera es la key.
+    Antes se perdía la primera carpeta ("1234/") y se firmaba un objeto inexistente."""
+    assert extraer_key(
+        f"https://gmtibtl.{CUENTA}.r2.cloudflarestorage.com/1234/factura.xml"
+    ) == "1234/factura.xml"
+
+
+def test_url_r2_virtual_host_key_en_raiz():
+    assert extraer_key(
+        f"https://gmtibtl.{CUENTA}.r2.cloudflarestorage.com/abc-123.jpg"
+    ) == "abc-123.jpg"
+
+
+def test_url_r2_virtual_host_jurisdiccion_eu():
+    assert extraer_key(
+        f"https://gmtibtl.{CUENTA}.eu.r2.cloudflarestorage.com/a/b/c.pdf"
+    ) == "a/b/c.pdf"
+
+
+def test_url_r2_virtual_host_prefirmada_y_acentos():
+    assert extraer_key(
+        f"https://gmtibtl.{CUENTA}.r2.cloudflarestorage.com/12/foto%20n%C3%BAm.jpg"
+        "?X-Amz-Signature=abc&X-Amz-Date=1"
+    ) == "12/foto núm.jpg"
+
+
+def test_url_r2_path_style_cuenta_real():
+    assert extraer_key(
+        f"https://{CUENTA}.r2.cloudflarestorage.com/gmtibtl/1234/factura.xml"
+    ) == "1234/factura.xml"
+
+
+def test_url_r2_virtual_host_sin_ruta_devuelve_none():
+    assert extraer_key(f"https://gmtibtl.{CUENTA}.r2.cloudflarestorage.com/") is None
+
+
 def test_dominio_propio():
     """files.linkmi.com no lleva bucket en la ruta: la ruta ES la key."""
     assert extraer_key("https://files.linkmi.com/linkmi/final/x.pdf") == "linkmi/final/x.pdf"
@@ -127,6 +167,7 @@ def test_idempotente():
         "https://s3.amazonaws.com/gmtibtl/linkmi/x.pdf",
         "352_nss_1771953752864.pdf",
         "s3://gmtibtl/linkmi/x.pdf",
+        f"https://gmtibtl.{CUENTA}.r2.cloudflarestorage.com/1234/factura.xml",
     ]:
         una = extraer_key(entrada)
         assert extraer_key(una) == una, f"no idempotente para {entrada}"
