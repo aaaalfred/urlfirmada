@@ -8,7 +8,13 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
-from storage_keys import extraer_key, limpiar_env
+from storage_keys import (
+    buckets_permitidos,
+    extraer_bucket_y_key,
+    extraer_key,
+    limpiar_env,
+    resolver_destino_descarga,
+)
 
 # Cargar variables de entorno desde .env
 load_dotenv()
@@ -77,6 +83,22 @@ S3_BUCKET = _bucket("BUCKET_NAME")
 S3_BUCKET_SECONDARY = _bucket("BUCKET_SECONDARY_NAME")  # Segundo bucket
 DOWNLOAD_BUCKET = _bucket("DOWNLOAD_BUCKET_NAME") or S3_BUCKET
 
+# Buckets contra los que /generate-download-url firma cuando recibe una URL de S3
+# con el bucket explícito. La app guarda URLs de mibucko (INE, fotos, firma,
+# video) y esos objetos solo existen ahí: firmarlos contra el bucket de descarga
+# da NoSuchKey. Por omisión: principal, secundario y descarga de la config; se
+# reemplaza con DOWNLOAD_ALLOWED_BUCKETS (nombres separados por comas). Un bucket
+# fuera de la lista se firma contra el de descarga, como siempre: sin esto el
+# servicio firmaría contra cualquier bucket que alcancen las credenciales.
+# Con STORAGE_PROVIDER=r2 no aplica: todo vive en un solo bucket y la key basta.
+if STORAGE_PROVIDER == "s3":
+    DOWNLOAD_ALLOWED_BUCKETS = buckets_permitidos(
+        limpiar_env("DOWNLOAD_ALLOWED_BUCKETS")
+        or [S3_BUCKET, S3_BUCKET_SECONDARY, DOWNLOAD_BUCKET]
+    )
+else:
+    DOWNLOAD_ALLOWED_BUCKETS = {}
+
 # SICOM no pasa por _bucket(): su bucket es siempre el de Amazon.
 S3_SICOM_BUCKET = limpiar_env("S3_SICOM_BUCKET_NAME")  # Bucket sicomimages
 
@@ -131,6 +153,7 @@ logger.info(
     "Proveedor de Linkmi: %s | buckets: principal=%s secundario=%s descarga=%s | SICOM: S3 (%s)",
     STORAGE_PROVIDER.upper(), S3_BUCKET, S3_BUCKET_SECONDARY, DOWNLOAD_BUCKET, S3_SICOM_BUCKET,
 )
+logger.info("Descarga por bucket de la URL: %s", sorted(DOWNLOAD_ALLOWED_BUCKETS.values()) or "desactivada")
 
 @app.get("/generate-presigned-url")
 async def generate_presigned_url(
@@ -185,14 +208,19 @@ async def generate_presigned_download_url(
     la base (S3 virtual-host o path-style, R2, dominio propio, s3://). Se
     normaliza antes de firmar: sin esto, una URL absoluta se firmaría como key
     literal y el almacén respondería NoSuchKey.
-    """
-    target_bucket = DOWNLOAD_BUCKET
 
-    if not target_bucket:
+    Con STORAGE_PROVIDER=s3, si la URL es de un bucket de DOWNLOAD_ALLOWED_BUCKETS
+    (por omisión principal, secundario y descarga) se firma contra ESE bucket.
+    Cualquier otro caso (key suelta, bucket no permitido, R2, dominio propio)
+    firma contra el bucket de descarga.
+    """
+    if not DOWNLOAD_BUCKET:
         logger.error("Ni S3_DOWNLOAD_BUCKET_NAME ni S3_BUCKET_NAME están configurados en las variables de entorno.")
         raise HTTPException(status_code=500, detail="Error interno del servidor: Bucket S3 para descarga no configurado.")
 
-    object_name = extraer_key(file_name)
+    target_bucket, object_name = resolver_destino_descarga(
+        file_name, DOWNLOAD_BUCKET, DOWNLOAD_ALLOWED_BUCKETS
+    )
     if not object_name:
         logger.warning("No se pudo obtener una key de: %r", file_name)
         raise HTTPException(
@@ -201,6 +229,15 @@ async def generate_presigned_download_url(
         )
     if object_name != file_name:
         logger.info("Referencia normalizada: %r -> %r", file_name, object_name)
+    if target_bucket != DOWNLOAD_BUCKET:
+        logger.info("Descarga firmada contra el bucket de la URL: %s", target_bucket)
+    elif DOWNLOAD_ALLOWED_BUCKETS:
+        bucket_url, _ = extraer_bucket_y_key(file_name)
+        if bucket_url and bucket_url not in DOWNLOAD_ALLOWED_BUCKETS:
+            logger.warning(
+                "Bucket %r de la URL no está en DOWNLOAD_ALLOWED_BUCKETS: se firma contra %s",
+                bucket_url, DOWNLOAD_BUCKET,
+            )
 
     try:
         response = s3_client.generate_presigned_url(
@@ -238,6 +275,7 @@ async def health_check():
             "sicom": S3_SICOM_BUCKET,
         },
         "normaliza_url_a_key": True,
+        "descarga_buckets_permitidos": sorted(DOWNLOAD_ALLOWED_BUCKETS.values()),
     }
 
 @app.get("/generate-presigned-url-secondary")

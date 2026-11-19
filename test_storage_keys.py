@@ -8,7 +8,12 @@ Ejecutar:  python3 -m pytest test_storage_keys.py -v
            python3 test_storage_keys.py          (sin pytest instalado)
 """
 
-from storage_keys import extraer_key
+from storage_keys import (
+    buckets_permitidos,
+    extraer_bucket_y_key,
+    extraer_key,
+    resolver_destino_descarga,
+)
 
 
 # --- Formas reales encontradas en la DB --------------------------------------
@@ -171,6 +176,200 @@ def test_idempotente():
     ]:
         una = extraer_key(entrada)
         assert extraer_key(una) == una, f"no idempotente para {entrada}"
+
+
+# --- extraer_bucket_y_key: el bucket que trae la URL -------------------------
+# Corrige el bug de las descargas en S3: la app guarda URLs de mibucko y el
+# servicio las firmaba contra el bucket de descarga (gmtibtl).
+
+def test_bucket_s3_virtual_host_con_region():
+    assert extraer_bucket_y_key(
+        "https://mibucko.s3.us-east-1.amazonaws.com/abc-123.jpg"
+    ) == ("mibucko", "abc-123.jpg")
+
+
+def test_bucket_s3_virtual_host_sin_region():
+    assert extraer_bucket_y_key("https://mibucko.s3.amazonaws.com/abc-123.jpg") == \
+        ("mibucko", "abc-123.jpg")
+
+
+def test_bucket_s3_virtual_host_conserva_carpetas():
+    assert extraer_bucket_y_key("https://gmtibtl.s3.amazonaws.com/linkmi/x.pdf") == \
+        ("gmtibtl", "linkmi/x.pdf")
+
+
+def test_bucket_s3_virtual_host_variantes_de_host():
+    """Regiones con formato antiguo (s3-<región>), dualstack y bucket con puntos."""
+    assert extraer_bucket_y_key("https://mibucko.s3-us-west-2.amazonaws.com/a.jpg") == \
+        ("mibucko", "a.jpg")
+    assert extraer_bucket_y_key("https://mibucko.s3.dualstack.us-east-1.amazonaws.com/a.jpg") == \
+        ("mibucko", "a.jpg")
+    assert extraer_bucket_y_key("https://mi.bucko.s3.amazonaws.com/a.jpg") == \
+        ("mi.bucko", "a.jpg")
+
+
+def test_bucket_s3_path_style():
+    assert extraer_bucket_y_key("https://s3.amazonaws.com/mibucko/linkmi/x.pdf") == \
+        ("mibucko", "linkmi/x.pdf")
+
+
+def test_bucket_s3_path_style_con_region():
+    assert extraer_bucket_y_key("https://s3.us-east-1.amazonaws.com/gmtibtl/x.pdf") == \
+        ("gmtibtl", "x.pdf")
+
+
+def test_bucket_esquema_s3():
+    assert extraer_bucket_y_key("s3://facturaciongmt/12/f.xml") == ("facturaciongmt", "12/f.xml")
+
+
+def test_bucket_en_minusculas():
+    assert extraer_bucket_y_key("https://MiBucko.s3.amazonaws.com/a.jpg") == ("mibucko", "a.jpg")
+
+
+def test_bucket_r2_siempre_none():
+    """En R2 todo vive en un solo bucket: la key basta y el bucket de la URL no cuenta."""
+    assert extraer_bucket_y_key(
+        f"https://gmtibtl.{CUENTA}.r2.cloudflarestorage.com/1234/factura.xml"
+    ) == (None, "1234/factura.xml")
+    assert extraer_bucket_y_key(
+        f"https://{CUENTA}.r2.cloudflarestorage.com/gmtibtl/1234/factura.xml"
+    ) == (None, "1234/factura.xml")
+
+
+def test_bucket_key_desnuda_y_dominio_propio_none():
+    assert extraer_bucket_y_key("abc-123.jpg") == (None, "abc-123.jpg")
+    assert extraer_bucket_y_key("linkmi/x.pdf") == (None, "linkmi/x.pdf")
+    assert extraer_bucket_y_key("https://files.linkmi.com/linkmi/x.pdf") == (None, "linkmi/x.pdf")
+
+
+def test_bucket_url_prefirmada_quita_el_query():
+    """Una URL ya firmada se puede volver a firmar: sin credenciales en la key."""
+    assert extraer_bucket_y_key(
+        "https://mibucko.s3.amazonaws.com/abc-123.jpg"
+        "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc&X-Amz-Date=20260101T000000Z"
+    ) == ("mibucko", "abc-123.jpg")
+
+
+def test_bucket_host_que_solo_se_parece_a_s3_no_devuelve_bucket():
+    """El host debe TERMINAR en amazonaws.com; un dominio ajeno no puede colar su bucket."""
+    assert extraer_bucket_y_key("https://mibucko.s3.amazonaws.com.evil.com/a.jpg")[0] is None
+    assert extraer_bucket_y_key("https://mibucko.s3.amazonaws.com@evil.com/a.jpg")[0] is None
+    assert extraer_bucket_y_key("https://evil.com/mibucko.s3.amazonaws.com/a.jpg")[0] is None
+
+
+def test_bucket_sin_key_devuelve_none_none():
+    assert extraer_bucket_y_key("https://mibucko.s3.amazonaws.com/") == (None, None)
+    assert extraer_bucket_y_key("https://s3.amazonaws.com/mibucko") == (None, None)
+    assert extraer_bucket_y_key("s3://mibucko") == (None, None)
+    assert extraer_bucket_y_key("") == (None, None)
+    assert extraer_bucket_y_key(None) == (None, None)
+    assert extraer_bucket_y_key(12345) == (None, None)
+
+
+def test_bucket_y_key_coinciden_con_extraer_key():
+    """extraer_bucket_y_key no puede discrepar de extraer_key en la key."""
+    for entrada in [
+        "https://mibucko.s3.us-east-1.amazonaws.com/abc-123.jpg",
+        "https://s3.amazonaws.com/gmtibtl/linkmi/x.pdf",
+        "https://gmtibtl.s3.amazonaws.com/linkmi/mi%20archivo.pdf?X-Amz-Signature=a",
+        "352_nss_1771953752864.pdf",
+        "s3://gmtibtl/linkmi/x.pdf",
+        f"https://gmtibtl.{CUENTA}.r2.cloudflarestorage.com/1234/factura.xml",
+        "https://files.linkmi.com/linkmi/final/x.pdf",
+        "https://mibucko.s3.amazonaws.com/",
+        "",
+    ]:
+        assert extraer_bucket_y_key(entrada)[1] == extraer_key(entrada), entrada
+
+
+# --- resolver_destino_descarga: contra qué bucket se firma -------------------
+
+PERMITIDOS = buckets_permitidos(["mibucko", "gmtibtl", "facturaciongmt"])
+DESCARGA = "gmtibtl"
+
+
+def test_permitidos_acepta_lista_y_cadena():
+    esperado = {"mibucko": "mibucko", "gmtibtl": "gmtibtl"}
+    assert buckets_permitidos("mibucko, gmtibtl") == esperado
+    assert buckets_permitidos('"mibucko";gmtibtl') == esperado
+    assert buckets_permitidos(["mibucko", None, "", "  gmtibtl "]) == esperado
+    assert buckets_permitidos(None) == {}
+    assert buckets_permitidos("") == {}
+
+
+def test_permitidos_firma_con_el_nombre_de_la_config():
+    """La comparación ignora mayúsculas, pero se firma con el nombre configurado."""
+    p = buckets_permitidos(["MiBucko"])
+    assert resolver_destino_descarga("https://mibucko.s3.amazonaws.com/a.jpg", "gmtibtl", p) == \
+        ("MiBucko", "a.jpg")
+
+
+def test_destino_mibucko_virtual_host_con_region():
+    assert resolver_destino_descarga(
+        "https://mibucko.s3.us-east-1.amazonaws.com/abc-123.jpg", DESCARGA, PERMITIDOS
+    ) == ("mibucko", "abc-123.jpg")
+
+
+def test_destino_mibucko_virtual_host_sin_region():
+    assert resolver_destino_descarga(
+        "https://mibucko.s3.amazonaws.com/abc-123.jpg", DESCARGA, PERMITIDOS
+    ) == ("mibucko", "abc-123.jpg")
+
+
+def test_destino_mibucko_path_style():
+    assert resolver_destino_descarga(
+        "https://s3.amazonaws.com/mibucko/abc-123.jpg", DESCARGA, PERMITIDOS
+    ) == ("mibucko", "abc-123.jpg")
+
+
+def test_destino_gmtibtl_y_secundario():
+    assert resolver_destino_descarga(
+        "https://gmtibtl.s3.amazonaws.com/linkmi/x.pdf", DESCARGA, PERMITIDOS
+    ) == ("gmtibtl", "linkmi/x.pdf")
+    assert resolver_destino_descarga(
+        "https://facturaciongmt.s3.amazonaws.com/12/f.xml", DESCARGA, PERMITIDOS
+    ) == ("facturaciongmt", "12/f.xml")
+
+
+def test_destino_bucket_no_permitido_va_al_de_descarga():
+    assert resolver_destino_descarga(
+        "https://sicomimages.s3.amazonaws.com/proy/a.jpg", DESCARGA, PERMITIDOS
+    ) == ("gmtibtl", "proy/a.jpg")
+
+
+def test_destino_key_suelta_va_al_de_descarga():
+    assert resolver_destino_descarga("abc-123.jpg", DESCARGA, PERMITIDOS) == \
+        ("gmtibtl", "abc-123.jpg")
+
+
+def test_destino_url_sin_bucket_identificable_va_al_de_descarga():
+    assert resolver_destino_descarga(
+        "https://files.linkmi.com/linkmi/x.pdf", DESCARGA, PERMITIDOS
+    ) == ("gmtibtl", "linkmi/x.pdf")
+
+
+def test_destino_url_ya_firmada_se_vuelve_a_firmar_contra_su_bucket():
+    assert resolver_destino_descarga(
+        "https://mibucko.s3.amazonaws.com/abc-123.jpg?X-Amz-Signature=abc&X-Amz-Expires=3600",
+        DESCARGA, PERMITIDOS,
+    ) == ("mibucko", "abc-123.jpg")
+
+
+def test_destino_r2_sin_lista_firma_siempre_contra_el_de_descarga():
+    """Con STORAGE_PROVIDER=r2 la lista va vacía: la URL no cambia el bucket."""
+    assert resolver_destino_descarga(
+        "https://mibucko.s3.amazonaws.com/abc-123.jpg", DESCARGA, {}
+    ) == ("gmtibtl", "abc-123.jpg")
+    assert resolver_destino_descarga(
+        f"https://gmtibtl.{CUENTA}.r2.cloudflarestorage.com/1234/factura.xml", DESCARGA, PERMITIDOS
+    ) == ("gmtibtl", "1234/factura.xml")
+
+
+def test_destino_sin_key_devuelve_none_none():
+    assert resolver_destino_descarga("https://mibucko.s3.amazonaws.com/", DESCARGA, PERMITIDOS) == \
+        (None, None)
+    assert resolver_destino_descarga("", DESCARGA, PERMITIDOS) == (None, None)
+    assert resolver_destino_descarga(None, DESCARGA, PERMITIDOS) == (None, None)
 
 
 if __name__ == "__main__":
